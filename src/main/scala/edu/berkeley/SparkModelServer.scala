@@ -21,14 +21,63 @@ object ModelServingSpark {
     val numUsers = args(1).toInt
     val numItems = args(2).toInt
     val modelDim = args(3).toInt
-    val percentOfItems = args(4).toDouble
+    val numReqs = args(4).toInt
+    val percentObs = args(5).toDouble
+    val percentOfItems = args(6).toDouble
+    
     val sparkHome = "/root/spark"
     println("Starting spark context")
 
     val sc = new SparkContext(sparkMaster, "SparkTestApp", sparkHome,
         SparkContext.jarOfObject(this).toSeq)
-    val modelServer = new ModelServer[Long](sc, numUsers, numItems, modelDim, percentOfItems)
+    val modelServer = new ModelServer(sc, numUsers, numItems, modelDim, percentOfItems)
+    val requestor = new Requestor(numUsers, numItems, percentObs)
 
+    val nanospersec = math.pow(10, 9)
+    var numPreds = 0
+    var numObs = 0
+
+
+    val startTime = System.nanoTime
+    var i = 0
+    while (i < numReqs) {
+
+      requestor.getRequest.fold(
+        oreq => {
+          modelServer.updateModel(oreq.uid, oreq.context, oreq.score)
+          numObs += 1
+          println(s"Making observation for user ${oreq.uid} and item ${oreq.context}")
+        },
+        preq => {
+          val result = modelServer.makePrediction(preq.uid, preq.context)
+          numPreds += 1
+          println(s"Prediction result: $result")
+        }
+      )
+
+      if (i % 10 == 0) {
+        println(s"Finished $i/$numReqs queries")
+
+      }
+
+      i += 1
+    }
+    modelServer.countRDDs()
+
+    val stopTime = System.nanoTime
+    val elapsedTime = (stopTime - startTime) / nanospersec
+    val pthruput = numPreds.toDouble / elapsedTime.toDouble
+    val othruput = numObs.toDouble / elapsedTime.toDouble
+    val totthruput = numReqs.toDouble / elapsedTime.toDouble
+
+    val outstr = (s"duration: ${elapsedTime}\n" +
+                  s"num_pred: ${numPreds}\n" +
+                  s"num_obs: ${numObs}\n" +
+                  s"pred_thru: ${pthruput}\n" +
+                  s"obs_thru: ${othruput}\n" +
+                  s"total_thru: ${totthruput}\n")
+
+    println(outstr)
 
 
     System.exit(0)
@@ -43,30 +92,30 @@ object ModelServingSpark {
 
 class ModelServer(sc: SparkContext, numUsers: Int, numItems: Int, modelDim: Int, percentOfItems: Double) {
 
-  val maxScore = 10
+  private val maxScore = 10
 
-  var trainingDataRDD: RDD[(Long, Map[Long, Score])] = createTrainingDataRDD
+  private var trainingDataRDD: RDD[(Long, Map[Long, Double])] = createTrainingDataRDD
 
-  var modelsRDD: RDD[(Long, Array[Double])] = createModelsRDD
+  private var modelsRDD: RDD[(Long, Array[Double])] = createModelsRDD
 
   // potential optimization: Make features a map, not RDD and make a broadcast variable
-  var featuresRDD: RDD[(Long, Array[Double])] = createFeaturesRDD
+  private var featuresRDD: RDD[(Long, Array[Double])] = createFeaturesRDD
 
-  var partialSumsRDD: RDD[(Long, (DenseMatrix[Double], DenseVector[Double]))] = initializePartialSums(sc)
+  private var partialSumsRDD: RDD[(Long, (DenseMatrix[Double], DenseVector[Double]))] = initializePartialSums
 
 
   // convenience RDDs for initalizing datasets
-  val usersRDD = sc.parallelize((0 until numUsers)).cache()
-  val itemsRDD = sc.parallelize((0 until numItems)).cache()
+  private val usersRDD = sc.parallelize((0 until numUsers)).cache()
+  private val itemsRDD = sc.parallelize((0 until numItems)).cache()
 
-  def createModelsRDD: RDD[(Long, Array[Double])] = {
+  private def createModelsRDD: RDD[(Long, Array[Double])] = {
     usersRDD.map(id => {
       val rand = new Random
       (id, randomArray(rand, modelDim))
     })
   }
 
-  def createTrainingDataRDD: RDD[(Long, Map[Long, Score])] = {
+  private def createTrainingDataRDD: RDD[(Long, Map[Long, Double])] = {
     usersRDD.map(id => {
       val rand = new Random
       val userObsMap = (0 until (numItems*percentOfItems/100.0).toInt)
@@ -76,17 +125,17 @@ class ModelServer(sc: SparkContext, numUsers: Int, numItems: Int, modelDim: Int,
 
   }
 
-  def createFeaturesRDD: RDD[(Long, Array[Double])] = {
+  private def createFeaturesRDD: RDD[(Long, Array[Double])] = {
     itemsRDD.map(id => {
       val rand = new Random
       (id, randomArray(rand, modelDim))
     })
   }
 
-  def initializePartialSums: RDD[(Long, (DenseMatrix[Double], DenseVector[Double]))] = {
+  private def initializePartialSums: RDD[(Long, (DenseMatrix[Double], DenseVector[Double]))] = {
     usersRDD.map(id => {
-      val fakeSums = (DenseMatrix.rand[Double](numFeatures, numFeatures),
-        DenseVector.rand[Double](numFeatures))
+      val fakeSums = (DenseMatrix.rand[Double](modelDim, modelDim),
+        DenseVector.rand[Double](modelDim))
       (id, fakeSums)
     })
   }
@@ -101,66 +150,74 @@ class ModelServer(sc: SparkContext, numUsers: Int, numItems: Int, modelDim: Int,
     arr
   }
 
-  /**
-   * Update using partial sum
-   */
-  def updateModel(uid: Long, item: Long, score: Double) {
-    val partialResults = lookup(uid, partialSumsRDD)
-    val partialFeaturesSum = partialFeaturesSum._1
-    val partialScoresSum = partialFeaturesSum._2
-    val newScore = Map(item -> score)
-    val itemFeatures = lookup(item, features)
-
-    val (newWeights, newPartialResult) = UpdateMethods.updateWithBreeze(
-      partialFeaturesSum, partialScoresSum, itemFeatures, newScore, modelDim)
-    partialSumsRDD = updateRDD(uid, newPartialResult, partialSumsRDD)
-    modelsRDD = updateRDD(uid, newWeights, modelsRDD)
-    trainingDataRDD = updateRDD(uid, item, score, trainingDataRDD)
+  def countRDDs() {
+    trainingDataRDD.count()
+    modelsRDD.count()
+    partialSumsRDD.count()
+    featuresRDD.count()
   }
 
-  def lookup[T](id: Long, rdd: RDD[(Long, T)]): T = {
-    (rdd.filter(_._1 == id).collect())(0)._2
-  }
+  def makePrediction(user: Long, item: Long): Double = {
 
-  def updateRDD[T](uid: Long, value: T, rdd: RDD[(Long, T)]): RDD[(Long, T)] = {
-
-    rdd.map({ case(key, oldVal) => {
-      if (key == uid) {
-        (key, value)
-      } else {
-        (key, oldVal)
-      }
-    })
-  }
-
-  def appendScore[T](uid: Long, mapKey: T, score: Double, rdd: RDD[(Long, Map[T, Double])])
-      : RDD[(Long, Map[T, Double])] = {
-
-    rdd.map({ case(key, map) => {
-      if (key == uid) {
-        (key, map + (mapkey -> score))
-      } else {
-        (key, map)
-      }
-    })
-  }
-
-
-  def makePrediction(user: Long,
-                     item: Long,
-                     models: RDD[(Long, Array[Double])],
-                     features: RDD[(Long, Array[Double])]): Double = {
-
-    val userModel = lookup(models, user)
-    val itemFeatures = lookup(features, item)
+    val userModel = lookup(user, modelsRDD)
+    val itemFeatures = lookup(item, featuresRDD)
     var i = 0
     var prediction = 0.0
-    while (i < user.size) {
+    while (i < userModel.size) {
       prediction += userModel(i)*itemFeatures(i)
       i += 1
     }
     prediction
   }
+
+  /**
+   * Update using partial sum
+   */
+  def updateModel(uid: Long, item: Long, score: Double) {
+    val partialResults = lookup(uid, partialSumsRDD)
+    val partialFeaturesSum = partialResults._1
+    val partialScoresSum = partialResults._2
+    val newScore = Map(item -> score)
+    val itemFeatures = Map(item -> lookup(item, featuresRDD))
+
+
+    val (newWeights, newPartialResult) = UpdateMethods.updateWithBreeze(
+      partialFeaturesSum, partialScoresSum, itemFeatures, newScore, modelDim)
+    partialSumsRDD = updateRDD(uid, newPartialResult, partialSumsRDD)
+    modelsRDD = updateRDD(uid, newWeights, modelsRDD)
+    trainingDataRDD = appendScore(uid, item, score, trainingDataRDD)
+  }
+
+  private def lookup[T](id: Long, rdd: RDD[(Long, T)]): T = {
+    (rdd.filter(_._1 == id).collect())(0)._2
+  }
+
+  private def updateRDD[T](uid: Long, value: T, rdd: RDD[(Long, T)]): RDD[(Long, T)] = {
+
+    rdd.map({ case(key, oldVal) => {
+        if (key == uid) {
+          (key, value)
+        } else {
+          (key, oldVal)
+        }
+      }
+    })
+  }
+
+  private def appendScore[T](uid: Long, mapKey: T, score: Double, rdd: RDD[(Long, Map[T, Double])])
+      : RDD[(Long, Map[T, Double])] = {
+
+    rdd.map({ case(key, map) => {
+        if (key == uid) {
+          (key, map + (mapKey -> score))
+        } else {
+          (key, map)
+        }
+      }
+    })
+  }
+
+
 
 }
 
@@ -176,9 +233,9 @@ object UpdateMethods {
   def updateWithBreeze[T](
       partialFeaturesSum: DenseMatrix[Double],
       partialScoresSum: DenseVector[Double],
-      newItems: Map[T, FeatureVector],
+      newItems: Map[T, Array[Double]],
       newScores: Map[T, Double],
-      k: Int): (WeightVector, (DenseMatrix[Double], DenseVector[Double])) = {
+      k: Int): (Array[Double], (DenseMatrix[Double], DenseVector[Double])) = {
 
 
 
